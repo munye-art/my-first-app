@@ -157,8 +157,10 @@ ${trimmed}`;
   );
 
   const data = await response.json();
+  console.log("yt-factcheck: Gemini status:", response.status);
+  console.log("yt-factcheck: Gemini response:", JSON.stringify(data).slice(0, 400));
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error("No response from Gemini.");
+  if (!text) throw new Error(`Gemini error: ${JSON.stringify(data?.error || data).slice(0, 200)}`);
 
   const jsonMatch = text.match(/\[[\s\S]*\]/);
   if (!jsonMatch) throw new Error("Could not parse claims from AI response.");
