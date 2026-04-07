@@ -79,18 +79,35 @@ async function fetchTranscript(_videoId) {
 
   if (!params) return null;
 
+  // Step 2b: extract client context from page
+  let clientContext = { clientName: "WEB", clientVersion: "2.20230619.01.00" };
+  for (const script of scripts) {
+    const content = script.textContent;
+    if (!content.includes("INNERTUBE_CONTEXT")) continue;
+    const match = content.match(/"INNERTUBE_CONTEXT"\s*:\s*(\{.+?\})\s*[,;]/s);
+    if (match) {
+      try {
+        const ctx = JSON.parse(match[1]);
+        if (ctx.client) { clientContext = ctx.client; break; }
+      } catch {}
+    }
+  }
+  console.log("yt-factcheck: client:", JSON.stringify(clientContext).slice(0, 100));
+
   // Step 3: call YouTube's internal transcript API
   try {
     const res = await fetch(
       `https://www.youtube.com/youtubei/v1/get_transcript?key=${apiKey}`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-YouTube-Client-Name": "1",
+          "X-YouTube-Client-Version": clientContext.clientVersion || "2.20230619.01.00"
+        },
         credentials: "include",
         body: JSON.stringify({
-          context: {
-            client: { clientName: "WEB", clientVersion: "2.20230619.01.00" }
-          },
+          context: { client: clientContext },
           params
         })
       }
