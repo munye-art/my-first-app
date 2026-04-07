@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Fact Checker",
+  "version": "1.0",
+  "description": "Live fact checking for YouTube videos using AI",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://generativelanguage.googleapis.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/watch*"],
+      "js": ["content.js"],
+      "css": ["style.css"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "YouTube Fact Checker"
+  }
+}
