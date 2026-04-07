@@ -54,53 +54,25 @@
   });
 })();
 
-// Fetch YouTube transcript by reading ytInitialPlayerResponse from the page
+// Fetch YouTube transcript directly via timedtext API
 async function fetchTranscript(videoId) {
-  // Step 1: inject a script into the page context to read ytInitialPlayerResponse
-  const baseUrl = await new Promise((resolve) => {
-    window.addEventListener("message", function handler(e) {
-      if (e.source !== window || e.data?.type !== "yt-fc-track-url") return;
-      window.removeEventListener("message", handler);
-      resolve(e.data.url || null);
-    });
+  const langs = ["en", "en-GB", "en-US"];
 
-    const script = document.createElement("script");
-    script.textContent = `
-      (function() {
-        try {
-          const data = window.ytInitialPlayerResponse;
-          const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-          if (tracks && tracks.length) {
-            const track = tracks.find(t => t.languageCode === "en")
-              || tracks.find(t => t.languageCode?.startsWith("en"))
-              || tracks[0];
-            window.postMessage({ type: "yt-fc-track-url", url: track?.baseUrl || null }, "*");
-          } else {
-            window.postMessage({ type: "yt-fc-track-url", url: null }, "*");
-          }
-        } catch(e) {
-          window.postMessage({ type: "yt-fc-track-url", url: null }, "*");
-        }
-      })();
-    `;
-    document.documentElement.appendChild(script);
-    script.remove();
-  });
+  for (const lang of langs) {
+    try {
+      const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=srv3`;
+      const res = await fetch(url);
+      const text = await res.text();
+      if (!text || text.length < 50) continue;
 
-  if (!baseUrl) return null;
+      // Parse XML response
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(text, "text/xml");
+      const nodes = Array.from(xml.querySelectorAll("s, text"));
+      if (!nodes.length) continue;
 
-  // Step 2: fetch the transcript from the URL
-  try {
-    const res = await fetch(baseUrl);
-    const rawText = await res.text();
-
-    // Try XML parsing (most reliable)
-    const parser = new DOMParser();
-    const xml = parser.parseFromString(rawText, "text/xml");
-    const texts = Array.from(xml.querySelectorAll("text"));
-    if (texts.length) {
-      return texts
-        .map(t => t.textContent
+      return nodes
+        .map(n => n.textContent
           .replace(/&#39;/g, "'")
           .replace(/&amp;/g, "&")
           .replace(/&quot;/g, '"')
@@ -109,26 +81,29 @@ async function fetchTranscript(videoId) {
         .join(" ")
         .replace(/\s+/g, " ")
         .trim();
-    }
+    } catch {}
+  }
 
-    // Fallback: JSON3 format
-    try {
-      const data = JSON.parse(rawText);
-      if (data?.events) {
-        return data.events
-          .filter(e => e.segs)
-          .map(e => e.segs.map(s => s.utf8).join(""))
+  // Fallback: try auto-generated captions
+  try {
+    const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&kind=asr&fmt=srv3`;
+    const res = await fetch(url);
+    const text = await res.text();
+    if (text && text.length > 50) {
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(text, "text/xml");
+      const nodes = Array.from(xml.querySelectorAll("s, text"));
+      if (nodes.length) {
+        return nodes
+          .map(n => n.textContent)
           .join(" ")
           .replace(/\s+/g, " ")
           .trim();
       }
-    } catch {}
+    }
+  } catch {}
 
-    return null;
-  } catch (e) {
-    console.error("Transcript fetch error:", e);
-    return null;
-  }
+  return null;
 }
 
 // Send transcript to Gemini and extract factual claims
