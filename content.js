@@ -90,12 +90,21 @@ async function fetchTranscript(videoId) {
 
   // Step 2: fetch the transcript XML
   try {
-    const res = await fetch(baseUrl);
+    const res = await fetch(baseUrl, { credentials: "include" });
     const text = await res.text();
+
+    console.log("yt-factcheck: transcript response length:", text.length);
+    console.log("yt-factcheck: transcript preview:", text.slice(0, 300));
 
     const parser = new DOMParser();
     const xml = parser.parseFromString(text, "text/xml");
-    const nodes = Array.from(xml.querySelectorAll("text"));
+
+    // Try multiple element names YouTube uses
+    let nodes = Array.from(xml.querySelectorAll("text"));
+    if (!nodes.length) nodes = Array.from(xml.querySelectorAll("p"));
+    if (!nodes.length) nodes = Array.from(xml.querySelectorAll("s"));
+
+    console.log("yt-factcheck: nodes found:", nodes.length);
     if (!nodes.length) return null;
 
     return nodes
