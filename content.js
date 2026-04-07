@@ -54,84 +54,70 @@
   });
 })();
 
-// Fetch YouTube transcript using YouTube's internal transcript API
+// Fetch transcript by opening YouTube's transcript panel and reading the DOM
 async function fetchTranscript(_videoId) {
-  const scripts = document.querySelectorAll("script");
+  // If transcript panel is already open, read it directly
+  const existing = readTranscriptPanel();
+  if (existing) return existing;
 
-  // Step 1: get InnerTube API key from the page
-  let apiKey = null;
-  for (const script of scripts) {
-    const match = script.textContent.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
-    if (match) { apiKey = match[1]; break; }
+  // Try to open the transcript panel via YouTube's UI
+  const opened = await openTranscriptPanel();
+  if (!opened) return null;
+
+  // Wait up to 5 seconds for segments to appear
+  for (let i = 0; i < 10; i++) {
+    await sleep(500);
+    const text = readTranscriptPanel();
+    if (text) return text;
   }
-  console.log("yt-factcheck: apiKey found:", !!apiKey);
-  if (!apiKey) return null;
 
-  // Step 2: get transcript params from page
-  let params = null;
-  for (const script of scripts) {
-    const content = script.textContent;
-    if (!content.includes("getTranscriptEndpoint")) continue;
-    const match = content.match(/"getTranscriptEndpoint":\{"params":"([^"]+)"\}/);
-    if (match) { params = match[1]; break; }
-  }
-  console.log("yt-factcheck: params:", params);
+  return null;
+}
 
-  if (!params) return null;
+function readTranscriptPanel() {
+  const segs = document.querySelectorAll("ytd-transcript-segment-renderer .segment-text");
+  if (!segs.length) return null;
+  return Array.from(segs).map(s => s.textContent.trim()).filter(Boolean).join(" ");
+}
 
-  // Step 2b: extract client context from page
-  let clientContext = { clientName: "WEB", clientVersion: "2.20230619.01.00" };
-  for (const script of scripts) {
-    const content = script.textContent;
-    if (!content.includes("INNERTUBE_CONTEXT")) continue;
-    const match = content.match(/"INNERTUBE_CONTEXT"\s*:\s*(\{.+?\})\s*[,;]/s);
-    if (match) {
-      try {
-        const ctx = JSON.parse(match[1]);
-        if (ctx.client) { clientContext = ctx.client; break; }
-      } catch {}
+async function openTranscriptPanel() {
+  // Method 1: look for a visible "Show transcript" button anywhere
+  const allButtons = document.querySelectorAll("button, [role='button'], tp-yt-paper-button");
+  for (const btn of allButtons) {
+    const label = (btn.textContent || btn.getAttribute("aria-label") || "").toLowerCase();
+    if (label.includes("transcript")) {
+      btn.click();
+      return true;
     }
   }
-  console.log("yt-factcheck: client:", JSON.stringify(clientContext).slice(0, 100));
 
-  // Step 3: call YouTube's internal transcript API
-  try {
-    const res = await fetch(
-      `https://www.youtube.com/youtubei/v1/get_transcript?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-YouTube-Client-Name": "1",
-          "X-YouTube-Client-Version": clientContext.clientVersion || "2.20230619.01.00"
-        },
-        credentials: "include",
-        body: JSON.stringify({
-          context: { client: clientContext },
-          params
-        })
+  // Method 2: open the "..." more actions menu and find transcript option
+  const moreBtn =
+    document.querySelector("#above-the-fold #button-shape button") ||
+    document.querySelector("ytd-menu-renderer yt-button-shape button") ||
+    document.querySelector("#info-contents ytd-menu-renderer button");
+
+  if (moreBtn) {
+    moreBtn.click();
+    await sleep(600);
+
+    const items = document.querySelectorAll("tp-yt-paper-item, ytd-menu-service-item-renderer");
+    for (const item of items) {
+      if (item.textContent?.toLowerCase().includes("transcript")) {
+        item.click();
+        return true;
       }
-    );
+    }
 
-    const data = await res.json();
-    console.log("yt-factcheck: transcript API response:", JSON.stringify(data).slice(0, 300));
-
-    const segments = data?.actions?.[0]?.updateEngagementPanelAction
-      ?.content?.transcriptRenderer?.content
-      ?.transcriptSearchPanelRenderer?.body
-      ?.transcriptSegmentListRenderer?.initialSegments;
-
-    if (!segments?.length) return null;
-
-    return segments
-      .map(s => s?.transcriptSegmentRenderer?.snippet?.runs?.[0]?.text || "")
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
-  } catch (e) {
-    console.error("Transcript API error:", e);
-    return null;
+    // Close menu if transcript not found
+    document.body.click();
   }
+
+  return false;
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 // Send transcript to Gemini and extract factual claims
