@@ -64,12 +64,19 @@ async function fetchTranscript(videoId) {
     const content = script.textContent;
     if (!content.includes("captionTracks")) continue;
 
-    // Extract baseUrl values that point to timedtext API, try english first
-    const allUrls = [...content.matchAll(/"baseUrl":"(https:\\\/\\\/www\.youtube\.com\\\/api\\\/timedtext[^"]+)"/g)];
+    // Extract any baseUrl containing "timedtext"
+    const allUrls = [...content.matchAll(/"baseUrl":"([^"]*timedtext[^"]*)"/g)];
     if (!allUrls.length) continue;
 
-    // Decode escaped slashes
-    const decoded = allUrls.map(m => m[1].replace(/\\\//g, "/").replace(/\\u0026/g, "&"));
+    // Decode escape sequences
+    const decoded = allUrls.map(m =>
+      m[1]
+        .replace(/\\u0026/g, "&")
+        .replace(/\\u003d/g, "=")
+        .replace(/\\\//g, "/")
+    );
+
+    console.log("yt-factcheck: found URLs:", decoded);
 
     // Prefer english track
     const enUrl = decoded.find(u => u.includes("lang=en") || u.includes("lang%3Den"));
