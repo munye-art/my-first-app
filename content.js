@@ -54,71 +54,64 @@
   });
 })();
 
-// Fetch YouTube transcript by reading script tags already on the page
+// Fetch YouTube transcript using YouTube's internal transcript API
 async function fetchTranscript(videoId) {
-  // Step 1: find the caption track URL from page script tags
-  let baseUrl = null;
-
   const scripts = document.querySelectorAll("script");
+
+  // Step 1: get InnerTube API key
+  let apiKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  for (const script of scripts) {
+    const match = script.textContent.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
+    if (match) { apiKey = match[1]; break; }
+  }
+  console.log("yt-factcheck: apiKey:", apiKey);
+
+  // Step 2: get transcript params from page
+  let params = null;
   for (const script of scripts) {
     const content = script.textContent;
-    if (!content.includes("captionTracks")) continue;
+    if (!content.includes("getTranscriptEndpoint")) continue;
+    const match = content.match(/"getTranscriptEndpoint":\{"params":"([^"]+)"\}/);
+    if (match) { params = match[1]; break; }
+  }
+  console.log("yt-factcheck: params:", params);
 
-    // Extract any baseUrl containing "timedtext"
-    const allUrls = [...content.matchAll(/"baseUrl":"([^"]*timedtext[^"]*)"/g)];
-    if (!allUrls.length) continue;
+  if (!params) return null;
 
-    // Decode escape sequences
-    const decoded = allUrls.map(m =>
-      m[1]
-        .replace(/\\u0026/g, "&")
-        .replace(/\\u003d/g, "=")
-        .replace(/\\\//g, "/")
+  // Step 3: call YouTube's internal transcript API
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/youtubei/v1/get_transcript?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          context: {
+            client: { clientName: "WEB", clientVersion: "2.20230619.01.00" }
+          },
+          params
+        })
+      }
     );
 
-    console.log("yt-factcheck: found URLs:", decoded);
+    const data = await res.json();
+    console.log("yt-factcheck: transcript API response:", JSON.stringify(data).slice(0, 300));
 
-    // Prefer english track
-    const enUrl = decoded.find(u => u.includes("lang=en") || u.includes("lang%3Den"));
-    baseUrl = enUrl || decoded[0];
-    if (baseUrl) break;
-  }
+    const segments = data?.actions?.[0]?.updateEngagementPanelAction
+      ?.content?.transcriptRenderer?.content
+      ?.transcriptSearchPanelRenderer?.body
+      ?.transcriptSegmentListRenderer?.initialSegments;
 
-  console.log("yt-factcheck: baseUrl found:", baseUrl);
+    if (!segments?.length) return null;
 
-  if (!baseUrl) return null;
-
-  // Step 2: fetch the transcript XML
-  try {
-    const res = await fetch(baseUrl, { credentials: "include" });
-    const text = await res.text();
-
-    console.log("yt-factcheck: transcript response length:", text.length);
-    console.log("yt-factcheck: transcript preview:", text.slice(0, 300));
-
-    const parser = new DOMParser();
-    const xml = parser.parseFromString(text, "text/xml");
-
-    // Try multiple element names YouTube uses
-    let nodes = Array.from(xml.querySelectorAll("text"));
-    if (!nodes.length) nodes = Array.from(xml.querySelectorAll("p"));
-    if (!nodes.length) nodes = Array.from(xml.querySelectorAll("s"));
-
-    console.log("yt-factcheck: nodes found:", nodes.length);
-    if (!nodes.length) return null;
-
-    return nodes
-      .map(n => n.textContent
-        .replace(/&#39;/g, "'")
-        .replace(/&amp;/g, "&")
-        .replace(/&quot;/g, '"')
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">"))
+    return segments
+      .map(s => s?.transcriptSegmentRenderer?.snippet?.runs?.[0]?.text || "")
       .join(" ")
       .replace(/\s+/g, " ")
       .trim();
   } catch (e) {
-    console.error("Transcript fetch error:", e);
+    console.error("Transcript API error:", e);
     return null;
   }
 }
