@@ -85,28 +85,36 @@ async function fetchTranscript(videoId) {
       if (!baseUrl) { resolve(null); return; }
 
       try {
-        const res = await fetch(baseUrl + "&fmt=json3");
-        const data = await res.json();
+        // Fetch as text first, then decide how to parse
+        const res = await fetch(baseUrl);
+        const rawText = await res.text();
 
-        if (data?.events) {
-          const text = data.events
-            .filter(e => e.segs)
-            .map(e => e.segs.map(s => s.utf8).join(""))
-            .join(" ")
-            .replace(/\s+/g, " ")
-            .trim();
-          resolve(text || null);
-          return;
-        }
+        // Try JSON3 format
+        try {
+          const data = JSON.parse(rawText);
+          if (data?.events) {
+            const text = data.events
+              .filter(e => e.segs)
+              .map(e => e.segs.map(s => s.utf8).join(""))
+              .join(" ")
+              .replace(/\s+/g, " ")
+              .trim();
+            if (text) { resolve(text); return; }
+          }
+        } catch {}
 
         // Fallback: XML format
-        const xmlRes = await fetch(baseUrl);
-        const xmlText = await xmlRes.text();
         const parser = new DOMParser();
-        const xml = parser.parseFromString(xmlText, "text/xml");
+        const xml = parser.parseFromString(rawText, "text/xml");
         const texts = Array.from(xml.querySelectorAll("text"));
-        resolve(texts.map(t => t.textContent).join(" ").replace(/\s+/g, " ").trim() || null);
-      } catch {
+        const text = texts
+          .map(t => t.textContent.replace(/&#39;/g, "'").replace(/&amp;/g, "&").replace(/&quot;/g, '"'))
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+        resolve(text || null);
+      } catch (e) {
+        console.error("Transcript fetch error:", e);
         resolve(null);
       }
     }, { once: true });
