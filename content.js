@@ -54,56 +54,59 @@
   });
 })();
 
-// Fetch YouTube transcript directly via timedtext API
+// Fetch YouTube transcript by reading script tags already on the page
 async function fetchTranscript(videoId) {
-  const langs = ["en", "en-GB", "en-US"];
+  // Step 1: find the caption track URL from page script tags
+  let baseUrl = null;
 
-  for (const lang of langs) {
+  const scripts = document.querySelectorAll("script");
+  for (const script of scripts) {
+    const content = script.textContent;
+    if (!content.includes("captionTracks")) continue;
+
+    const match = content.match(/"captionTracks":(\[[\s\S]*?\])/);
+    if (!match) continue;
+
     try {
-      const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=srv3`;
-      const res = await fetch(url);
-      const text = await res.text();
-      if (!text || text.length < 50) continue;
-
-      // Parse XML response
-      const parser = new DOMParser();
-      const xml = parser.parseFromString(text, "text/xml");
-      const nodes = Array.from(xml.querySelectorAll("s, text"));
-      if (!nodes.length) continue;
-
-      return nodes
-        .map(n => n.textContent
-          .replace(/&#39;/g, "'")
-          .replace(/&amp;/g, "&")
-          .replace(/&quot;/g, '"')
-          .replace(/&lt;/g, "<")
-          .replace(/&gt;/g, ">"))
-        .join(" ")
-        .replace(/\s+/g, " ")
-        .trim();
+      // clean up escaped unicode before parsing
+      const cleaned = match[1].replace(/\\u0026/g, "&").replace(/\\"/g, '"');
+      const tracks = JSON.parse(cleaned);
+      const track = tracks.find(t => t.languageCode === "en")
+        || tracks.find(t => t.languageCode?.startsWith("en"))
+        || tracks[0];
+      if (track?.baseUrl) {
+        baseUrl = track.baseUrl;
+        break;
+      }
     } catch {}
   }
 
-  // Fallback: try auto-generated captions
-  try {
-    const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&kind=asr&fmt=srv3`;
-    const res = await fetch(url);
-    const text = await res.text();
-    if (text && text.length > 50) {
-      const parser = new DOMParser();
-      const xml = parser.parseFromString(text, "text/xml");
-      const nodes = Array.from(xml.querySelectorAll("s, text"));
-      if (nodes.length) {
-        return nodes
-          .map(n => n.textContent)
-          .join(" ")
-          .replace(/\s+/g, " ")
-          .trim();
-      }
-    }
-  } catch {}
+  if (!baseUrl) return null;
 
-  return null;
+  // Step 2: fetch the transcript XML
+  try {
+    const res = await fetch(baseUrl);
+    const text = await res.text();
+
+    const parser = new DOMParser();
+    const xml = parser.parseFromString(text, "text/xml");
+    const nodes = Array.from(xml.querySelectorAll("text"));
+    if (!nodes.length) return null;
+
+    return nodes
+      .map(n => n.textContent
+        .replace(/&#39;/g, "'")
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">"))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  } catch (e) {
+    console.error("Transcript fetch error:", e);
+    return null;
+  }
 }
 
 // Send transcript to Gemini and extract factual claims
