@@ -54,70 +54,66 @@
   });
 })();
 
-// Fetch YouTube transcript using the timedtext API
+// Fetch YouTube transcript by reading ytInitialPlayerResponse from the page
 async function fetchTranscript(videoId) {
-  try {
-    const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`);
-    const pageText = await pageRes.text();
-
-    // Try multiple regex patterns to find caption tracks
-    let tracks = null;
-
-    const match1 = pageText.match(/"captionTracks":(\[.*?\])/s);
-    if (match1) {
-      try { tracks = JSON.parse(match1[1]); } catch {}
-    }
-
-    if (!tracks) {
-      const match2 = pageText.match(/"captionTracks":\s*(\[[\s\S]*?\])\s*,\s*"/);
-      if (match2) {
-        try { tracks = JSON.parse(match2[1]); } catch {}
-      }
-    }
-
-    if (!tracks) {
-      // Try extracting from ytInitialPlayerResponse
-      const match3 = pageText.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;/s);
-      if (match3) {
+  return new Promise((resolve) => {
+    // Inject a script into the page context to access ytInitialPlayerResponse
+    const script = document.createElement("script");
+    script.textContent = `
+      (function() {
         try {
-          const playerData = JSON.parse(match3[1]);
-          tracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-        } catch {}
+          const data = window.ytInitialPlayerResponse;
+          const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+          if (tracks && tracks.length) {
+            const track = tracks.find(t => t.languageCode === "en")
+              || tracks.find(t => t.languageCode?.startsWith("en"))
+              || tracks[0];
+            if (track?.baseUrl) {
+              window.dispatchEvent(new CustomEvent("yt-fc-track", { detail: track.baseUrl }));
+              return;
+            }
+          }
+          window.dispatchEvent(new CustomEvent("yt-fc-track", { detail: null }));
+        } catch(e) {
+          window.dispatchEvent(new CustomEvent("yt-fc-track", { detail: null }));
+        }
+      })();
+    `;
+
+    window.addEventListener("yt-fc-track", async (e) => {
+      const baseUrl = e.detail;
+      if (!baseUrl) { resolve(null); return; }
+
+      try {
+        const res = await fetch(baseUrl + "&fmt=json3");
+        const data = await res.json();
+
+        if (data?.events) {
+          const text = data.events
+            .filter(e => e.segs)
+            .map(e => e.segs.map(s => s.utf8).join(""))
+            .join(" ")
+            .replace(/\s+/g, " ")
+            .trim();
+          resolve(text || null);
+          return;
+        }
+
+        // Fallback: XML format
+        const xmlRes = await fetch(baseUrl);
+        const xmlText = await xmlRes.text();
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(xmlText, "text/xml");
+        const texts = Array.from(xml.querySelectorAll("text"));
+        resolve(texts.map(t => t.textContent).join(" ").replace(/\s+/g, " ").trim() || null);
+      } catch {
+        resolve(null);
       }
-    }
+    }, { once: true });
 
-    if (!tracks || !tracks.length) return null;
-
-    const englishTrack = tracks.find(t => t.languageCode === "en")
-      || tracks.find(t => t.languageCode?.startsWith("en"))
-      || tracks[0];
-
-    if (!englishTrack?.baseUrl) return null;
-
-    const transcriptRes = await fetch(englishTrack.baseUrl + "&fmt=json3");
-    const transcriptData = await transcriptRes.json();
-
-    if (transcriptData?.events) {
-      return transcriptData.events
-        .filter(e => e.segs)
-        .map(e => e.segs.map(s => s.utf8).join(""))
-        .join(" ")
-        .replace(/\s+/g, " ")
-        .trim();
-    }
-
-    // Fallback to XML parsing
-    const transcriptXmlRes = await fetch(englishTrack.baseUrl);
-    const transcriptXml = await transcriptXmlRes.text();
-    const parser = new DOMParser();
-    const xml = parser.parseFromString(transcriptXml, "text/xml");
-    const texts = Array.from(xml.querySelectorAll("text"));
-    return texts.map(t => t.textContent).join(" ").replace(/\s+/g, " ").trim();
-
-  } catch (e) {
-    console.error("Transcript fetch error:", e);
-    return null;
-  }
+    document.documentElement.appendChild(script);
+    script.remove();
+  });
 }
 
 // Send transcript to Gemini and extract factual claims
