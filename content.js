@@ -60,21 +60,62 @@ async function fetchTranscript(videoId) {
     const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`);
     const pageText = await pageRes.text();
 
-    const match = pageText.match(/"captionTracks":(\[.*?\])/);
-    if (!match) return null;
+    // Try multiple regex patterns to find caption tracks
+    let tracks = null;
 
-    const tracks = JSON.parse(match[1]);
-    const englishTrack = tracks.find(t => t.languageCode === "en") || tracks[0];
-    if (!englishTrack) return null;
+    const match1 = pageText.match(/"captionTracks":(\[.*?\])/s);
+    if (match1) {
+      try { tracks = JSON.parse(match1[1]); } catch {}
+    }
 
-    const transcriptRes = await fetch(englishTrack.baseUrl);
-    const transcriptXml = await transcriptRes.text();
+    if (!tracks) {
+      const match2 = pageText.match(/"captionTracks":\s*(\[[\s\S]*?\])\s*,\s*"/);
+      if (match2) {
+        try { tracks = JSON.parse(match2[1]); } catch {}
+      }
+    }
 
+    if (!tracks) {
+      // Try extracting from ytInitialPlayerResponse
+      const match3 = pageText.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;/s);
+      if (match3) {
+        try {
+          const playerData = JSON.parse(match3[1]);
+          tracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        } catch {}
+      }
+    }
+
+    if (!tracks || !tracks.length) return null;
+
+    const englishTrack = tracks.find(t => t.languageCode === "en")
+      || tracks.find(t => t.languageCode?.startsWith("en"))
+      || tracks[0];
+
+    if (!englishTrack?.baseUrl) return null;
+
+    const transcriptRes = await fetch(englishTrack.baseUrl + "&fmt=json3");
+    const transcriptData = await transcriptRes.json();
+
+    if (transcriptData?.events) {
+      return transcriptData.events
+        .filter(e => e.segs)
+        .map(e => e.segs.map(s => s.utf8).join(""))
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    // Fallback to XML parsing
+    const transcriptXmlRes = await fetch(englishTrack.baseUrl);
+    const transcriptXml = await transcriptXmlRes.text();
     const parser = new DOMParser();
     const xml = parser.parseFromString(transcriptXml, "text/xml");
     const texts = Array.from(xml.querySelectorAll("text"));
     return texts.map(t => t.textContent).join(" ").replace(/\s+/g, " ").trim();
-  } catch {
+
+  } catch (e) {
+    console.error("Transcript fetch error:", e);
     return null;
   }
 }
