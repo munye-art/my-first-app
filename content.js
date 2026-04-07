@@ -55,16 +55,17 @@
 })();
 
 // Fetch YouTube transcript using YouTube's internal transcript API
-async function fetchTranscript(videoId) {
+async function fetchTranscript(_videoId) {
   const scripts = document.querySelectorAll("script");
 
-  // Step 1: get InnerTube API key
-  let apiKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  // Step 1: get InnerTube API key from the page
+  let apiKey = null;
   for (const script of scripts) {
     const match = script.textContent.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
     if (match) { apiKey = match[1]; break; }
   }
-  console.log("yt-factcheck: apiKey:", apiKey);
+  console.log("yt-factcheck: apiKey found:", !!apiKey);
+  if (!apiKey) return null;
 
   // Step 2: get transcript params from page
   let params = null;
