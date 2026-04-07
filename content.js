@@ -64,22 +64,20 @@ async function fetchTranscript(videoId) {
     const content = script.textContent;
     if (!content.includes("captionTracks")) continue;
 
-    const match = content.match(/"captionTracks":(\[[\s\S]*?\])/);
-    if (!match) continue;
+    // Extract baseUrl values that point to timedtext API, try english first
+    const allUrls = [...content.matchAll(/"baseUrl":"(https:\\\/\\\/www\.youtube\.com\\\/api\\\/timedtext[^"]+)"/g)];
+    if (!allUrls.length) continue;
 
-    try {
-      // clean up escaped unicode before parsing
-      const cleaned = match[1].replace(/\\u0026/g, "&").replace(/\\"/g, '"');
-      const tracks = JSON.parse(cleaned);
-      const track = tracks.find(t => t.languageCode === "en")
-        || tracks.find(t => t.languageCode?.startsWith("en"))
-        || tracks[0];
-      if (track?.baseUrl) {
-        baseUrl = track.baseUrl;
-        break;
-      }
-    } catch {}
+    // Decode escaped slashes
+    const decoded = allUrls.map(m => m[1].replace(/\\\//g, "/").replace(/\\u0026/g, "&"));
+
+    // Prefer english track
+    const enUrl = decoded.find(u => u.includes("lang=en") || u.includes("lang%3Den"));
+    baseUrl = enUrl || decoded[0];
+    if (baseUrl) break;
   }
+
+  console.log("yt-factcheck: baseUrl found:", baseUrl);
 
   if (!baseUrl) return null;
 
