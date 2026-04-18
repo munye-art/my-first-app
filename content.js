@@ -9,6 +9,7 @@ let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscript
   let analyzedUpToMs = 0;
   let analysisInterval = null;
   let currentApiKey = null;
+  let isAnalyzing = false;
 
   const CHUNK_MS = 4 * 60 * 1000; // analyze 4 minutes at a time
   const CHECK_INTERVAL_MS = 30 * 1000; // check every 30 seconds
@@ -67,6 +68,7 @@ let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscript
 
   async function startAnalysis(videoId) {
     clearInterval(analysisInterval);
+    isAnalyzing = false;
     lastAnalyzedVideoId = videoId;
     allClaims = [];
     transcriptEvents = null;
@@ -78,7 +80,10 @@ let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscript
     document.getElementById("yt-fc-filters").style.display = "none";
     document.getElementById("yt-fc-count").textContent = "";
 
-    setStatus("Fetching transcript...");
+    // Capture position BEFORE any async calls so we get the true current time
+    const currentMs = getVideoMs();
+    analyzedUpToMs = Math.max(0, currentMs - 5000);
+    setStatus(`Fetching transcript… (position: ${formatTime(currentMs)})`);
 
     const { geminiApiKey } = await chrome.storage.sync.get("geminiApiKey");
     if (!geminiApiKey) {
@@ -91,40 +96,54 @@ let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscript
     transcriptEvents = await fetchTranscriptEvents();
 
     if (!transcriptEvents) {
-      // Fall back: read DOM panel and analyze first chunk only
-      const text = readTranscriptPanel() || await openAndReadPanel();
-      if (!text) { setError("No transcript available for this video."); return; }
-      setStatus("Analysing...");
-      try {
-        const claims = await extractClaimsWithRetry(text.slice(0, 4000), geminiApiKey);
-        addClaims(claims);
-      } catch (e) { setError(e.message); }
-      return;
+      // Open transcript panel if needed for DOM fallback
+      if (!readTranscriptPanel(analyzedUpToMs)) await openAndReadPanel(analyzedUpToMs);
     }
 
-    // Start from current playback position (so jumping to 40min starts there)
-    const video = document.querySelector("video");
-    const currentMs = (video?.currentTime || 0) * 1000;
-    analyzedUpToMs = Math.max(0, currentMs - 5000);
-    await analyzeChunk(analyzedUpToMs + CHUNK_MS);
-
-    // Keep checking as video plays
+    // Analyze first chunk then keep going as video plays (both paths)
+    if (transcriptEvents) {
+      await analyzeChunk(analyzedUpToMs + CHUNK_MS);
+    } else {
+      await analyzeChunkFromDOM();
+    }
     analysisInterval = setInterval(checkProgress, CHECK_INTERVAL_MS);
   }
 
   async function checkProgress() {
-    if (!transcriptEvents || !currentApiKey) return;
-    const video = document.querySelector("video");
-    if (!video || video.paused) return;
-    const currentMs = video.currentTime * 1000;
-    if (currentMs < analyzedUpToMs + CHUNK_MS) return;
-    await analyzeChunk(currentMs);
+    if (isAnalyzing || !currentApiKey) return;
+    const currentMs = getVideoMs();
+    if (currentMs < analyzedUpToMs) return;
+    if (transcriptEvents) {
+      await analyzeChunk(currentMs);
+    } else {
+      await analyzeChunkFromDOM();
+    }
+  }
+
+  async function analyzeChunkFromDOM() {
+    if (isAnalyzing) return;
+    isAnalyzing = true;
+    const fromMs = analyzedUpToMs;
+    const toMs = fromMs + CHUNK_MS;
+    const text = readTranscriptPanel(fromMs);
+    if (!text) { analyzedUpToMs = toMs; isAnalyzing = false; return; }
+    const fromMin = Math.round(fromMs / 60000);
+    const toMin = Math.round(toMs / 60000);
+    setStatus(`Analysing ${fromMin}–${toMin} min...`, true);
+    try {
+      const claims = await extractClaimsWithRetry(text.slice(0, 4000), currentApiKey);
+      analyzedUpToMs = toMs;
+      addClaims(claims, fromMs);
+    } catch (e) { setError(e.message); }
+    isAnalyzing = false;
   }
 
   async function analyzeChunk(toMs) {
+    if (isAnalyzing) return;
+    isAnalyzing = true;
     const fromMs = analyzedUpToMs;
     const chunk = getTranscriptChunk(fromMs, toMs);
-    if (!chunk) { analyzedUpToMs = toMs; return; }
+    if (!chunk) { analyzedUpToMs = toMs; isAnalyzing = false; return; }
 
     const fromMin = Math.round(fromMs / 60000);
     const toMin = Math.round(toMs / 60000);
@@ -136,12 +155,14 @@ let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscript
       addClaims(claims, fromMs);
     } catch (e) {
       setError(e.message);
+    } finally {
+      isAnalyzing = false;
     }
   }
 
   function addClaims(newClaims, fromMs = 0) {
     if (!newClaims.length) { renderClaims(); return; }
-    allClaims.push(...newClaims.map(c => ({ ...c, timestampMs: fromMs })));
+    allClaims.push(...newClaims.map(c => ({ ...c, timestampMs: parseTimestamp(c.timestamp) || fromMs })));
     document.getElementById("yt-fc-count").textContent = `${allClaims.length} claim${allClaims.length !== 1 ? "s" : ""}`;
     document.getElementById("yt-fc-filters").style.display = "flex";
     renderClaims();
@@ -208,12 +229,21 @@ let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscript
 
 async function fetchTranscriptEvents() {
   let baseUrl = null;
+
+  // Method 1: find caption URL in page script tags (works on direct/fresh page load)
   for (const script of document.querySelectorAll("script")) {
     const t = script.textContent;
     if (!t.includes("captionTracks")) continue;
     const m = t.match(/"baseUrl":"(https?:\/\/[^"]+timedtext[^"]+)"/);
     if (m) { baseUrl = m[1].replace(/\\u0026/g, "&").replace(/\\/g, ""); break; }
   }
+
+  // Method 2: try direct timedtext API with video ID (auto-generated English captions)
+  if (!baseUrl) {
+    const videoId = new URLSearchParams(window.location.search).get("v");
+    if (videoId) baseUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&kind=asr`;
+  }
+
   if (!baseUrl) return null;
 
   try {
@@ -230,50 +260,102 @@ async function fetchTranscriptEvents() {
   }
 }
 
+
+function getVideoMs() {
+  // Most reliable: video element currentTime
+  let best = 0;
+  document.querySelectorAll("video").forEach(v => { if (v.currentTime > best) best = v.currentTime; });
+  if (best > 0) return best * 1000;
+
+  // Fallback: YouTube player API
+  const player = document.querySelector("#movie_player");
+  if (player && typeof player.getCurrentTime === "function") {
+    const t = player.getCurrentTime();
+    if (t > 0) return t * 1000;
+  }
+
+  // Fallback: time display text (unreliable on live streams — use only if above failed)
+  const timeEl = document.querySelector(".ytp-time-current");
+  if (timeEl && timeEl.textContent) {
+    const ms = parseTimestamp(timeEl.textContent.trim());
+    // Sanity check: ignore if it looks like a wall-clock time > video duration
+    const durEl = document.querySelector(".ytp-time-duration");
+    const durMs = durEl ? parseTimestamp(durEl.textContent.trim()) : Infinity;
+    if (ms > 0 && ms <= durMs) return ms;
+  }
+
+  return 0;
+}
+
+function parseTimestamp(ts) {
+  if (!ts) return 0;
+  const parts = String(ts).split(":").map(Number);
+  if (parts.length === 3) return (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000;
+  if (parts.length === 2) return (parts[0] * 60 + parts[1]) * 1000;
+  return 0;
+}
+
 function getTranscriptChunk(fromMs, toMs) {
   if (!transcriptEvents) return null;
-  const text = transcriptEvents
+  const lines = transcriptEvents
     .filter(e => e.tStartMs >= fromMs && e.tStartMs < toMs)
-    .map(e => e.text)
-    .join(" ")
-    .trim();
+    .map(e => `[${formatTime(e.tStartMs)}] ${e.text}`);
+  const text = lines.join("\n").trim();
   return text.length > 50 ? text : null;
 }
 
-function readTranscriptPanel() {
+function readTranscriptPanel(fromMs = 0) {
+  // Position-aware: parse timestamp directly from each segment's text content
+  // Try segment renderers first — position-aware via timestamp regex
+  const segs = document.querySelectorAll("ytd-transcript-segment-renderer");
+  if (segs.length > 3) {
+    const lines = [];
+    let lastKnownMs = 0;
+    for (const seg of segs) {
+      const raw = seg.textContent || "";
+      const tsMatch = raw.match(/(\d{1,2}:\d{2}(?::\d{2})?)/);
+      if (tsMatch) lastKnownMs = parseTimestamp(tsMatch[1]);
+      if (lastKnownMs > 0 && lastKnownMs < fromMs) continue;
+      const text = raw.replace(/\d{1,2}:\d{2}(?::\d{2})?/g, "")
+        .split("\n").map(l => l.trim()).filter(l => l && l.length > 2).join(" ");
+      if (text) lines.push(text);
+      if (lines.join(" ").length >= 4000) break;
+    }
+    if (lines.length > 5) return lines.join(" ").slice(0, 4000);
+  }
+
+  // Fallback: expanded panel innerText — position-aware by parsing timestamp lines
   const panels = document.querySelectorAll("ytd-engagement-panel-section-list-renderer");
   for (const panel of panels) {
     const visibility = panel.getAttribute("visibility") || "";
-    if (visibility.includes("EXPANDED")) {
-      const raw = panel.innerText || panel.textContent || "";
-      const lines = raw.split("\n")
-        .map(l => l.trim())
-        .filter(l => l && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(l) && l.length > 2);
-      if (lines.length > 5) return lines.join(" ");
+    if (!visibility.includes("EXPANDED")) continue;
+    const raw = panel.innerText || panel.textContent || "";
+    const parts = raw.split("\n");
+    let collecting = fromMs <= 0;
+    const lines = [];
+    for (const part of parts) {
+      const t = part.trim();
+      if (!t) continue;
+      if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(t)) {
+        if (!collecting && parseTimestamp(t) >= fromMs) collecting = true;
+        continue;
+      }
+      if (collecting && t.length > 2) {
+        lines.push(t);
+        if (lines.join(" ").length >= 4000) break;
+      }
     }
-  }
-  const selectors = [
-    "ytd-transcript-segment-renderer .segment-text",
-    "ytd-transcript-segment-renderer yt-formatted-string",
-    "ytd-transcript-segment-renderer",
-    ".segment-text",
-  ];
-  for (const sel of selectors) {
-    const segs = document.querySelectorAll(sel);
-    if (segs.length > 3) {
-      const text = Array.from(segs).map(s => s.textContent.trim()).filter(Boolean).join(" ");
-      if (text.length > 50) return text;
-    }
+    if (lines.length > 5) return lines.join(" ").slice(0, 4000);
   }
   return null;
 }
 
-async function openAndReadPanel() {
+async function openAndReadPanel(fromMs = 0) {
   const opened = await openTranscriptPanel();
   if (!opened) return null;
   for (let i = 0; i < 10; i++) {
     await sleep(500);
-    const text = readTranscriptPanel();
+    const text = readTranscriptPanel(fromMs);
     if (text) return text;
   }
   return null;
@@ -343,10 +425,12 @@ Return your response as a JSON array in this exact format:
   {
     "claim": "the factual claim here",
     "verdict": "LIKELY TRUE" | "LIKELY FALSE" | "UNVERIFIED",
-    "reason": "brief explanation"
+    "reason": "brief explanation",
+    "timestamp": "MM:SS"
   }
 ]
 
+Use the [MM:SS] markers in the transcript to set the timestamp to when the claim was made.
 Only return the JSON array, nothing else.
 
 Transcript:
