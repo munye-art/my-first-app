@@ -1,9 +1,17 @@
+let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscriptChunk outside IIFE
+
 (function () {
   if (document.getElementById("yt-factcheck-sidebar")) return;
 
   let lastAnalyzedVideoId = null;
   let allClaims = [];
   let activeFilter = "ALL";
+  let analyzedUpToMs = 0;
+  let analysisInterval = null;
+  let currentApiKey = null;
+
+  const CHUNK_MS = 4 * 60 * 1000; // analyze 4 minutes at a time
+  const CHECK_INTERVAL_MS = 30 * 1000; // check every 30 seconds
 
   const sidebar = document.createElement("div");
   sidebar.id = "yt-factcheck-sidebar";
@@ -54,68 +62,100 @@
 
   document.getElementById("yt-factcheck-btn").addEventListener("click", () => {
     const videoId = new URLSearchParams(window.location.search).get("v");
-    if (videoId) runAnalysis(videoId);
+    if (videoId) startAnalysis(videoId);
   });
 
-  async function runAnalysis(videoId) {
+  async function startAnalysis(videoId) {
+    clearInterval(analysisInterval);
     lastAnalyzedVideoId = videoId;
-    const resultsDiv = document.getElementById("yt-factcheck-results");
+    allClaims = [];
+    transcriptEvents = null;
+    analyzedUpToMs = 0;
+    activeFilter = "ALL";
+
+    document.querySelectorAll(".yt-fc-filter").forEach(b => b.classList.remove("yt-fc-filter-active"));
+    document.querySelector("[data-filter='ALL']").classList.add("yt-fc-filter-active");
     document.getElementById("yt-fc-filters").style.display = "none";
     document.getElementById("yt-fc-count").textContent = "";
 
-    resultsDiv.innerHTML = `
-      <div class="yt-fc-loading">
-        <div class="yt-fc-spinner"></div>
-        <span>Fetching transcript...</span>
-      </div>`;
+    setStatus("Fetching transcript...");
+
+    const { geminiApiKey } = await chrome.storage.sync.get("geminiApiKey");
+    if (!geminiApiKey) {
+      setError("No API key found. Set your Gemini API key in the extension popup.");
+      return;
+    }
+    currentApiKey = geminiApiKey;
+
+    // Try timed transcript first (preferred)
+    transcriptEvents = await fetchTranscriptEvents();
+
+    if (!transcriptEvents) {
+      // Fall back: read DOM panel and analyze first chunk only
+      const text = readTranscriptPanel() || await openAndReadPanel();
+      if (!text) { setError("No transcript available for this video."); return; }
+      setStatus("Analysing...");
+      try {
+        const claims = await extractClaimsWithRetry(text.slice(0, 4000), geminiApiKey);
+        addClaims(claims);
+      } catch (e) { setError(e.message); }
+      return;
+    }
+
+    // Analyze what's been watched so far (at least first chunk)
+    const video = document.querySelector("video");
+    const currentMs = (video?.currentTime || 0) * 1000;
+    const toMs = Math.max(currentMs, CHUNK_MS);
+    await analyzeChunk(toMs);
+
+    // Keep checking as video plays
+    analysisInterval = setInterval(checkProgress, CHECK_INTERVAL_MS);
+  }
+
+  async function checkProgress() {
+    if (!transcriptEvents || !currentApiKey) return;
+    const video = document.querySelector("video");
+    if (!video || video.paused) return;
+    const currentMs = video.currentTime * 1000;
+    if (currentMs < analyzedUpToMs + CHUNK_MS) return;
+    await analyzeChunk(currentMs);
+  }
+
+  async function analyzeChunk(toMs) {
+    const chunk = getTranscriptChunk(analyzedUpToMs, toMs);
+    if (!chunk) { analyzedUpToMs = toMs; return; }
+
+    const fromMin = Math.round(analyzedUpToMs / 60000);
+    const toMin = Math.round(toMs / 60000);
+    setStatus(`Analysing ${fromMin}–${toMin} min...`, true);
 
     try {
-      const transcript = await fetchTranscript(videoId);
-      if (!transcript) throw new Error("No transcript available for this video.");
-
-      resultsDiv.innerHTML = `
-        <div class="yt-fc-loading">
-          <div class="yt-fc-spinner"></div>
-          <span>Analysing claims...</span>
-        </div>`;
-
-      const { geminiApiKey } = await chrome.storage.sync.get("geminiApiKey");
-      if (!geminiApiKey) {
-        resultsDiv.innerHTML = "<p class='yt-fc-error'>No API key found. Set your Gemini API key in the extension popup.</p>";
-        return;
-      }
-
-      activeFilter = "ALL";
-      document.querySelectorAll(".yt-fc-filter").forEach(b => b.classList.remove("yt-fc-filter-active"));
-      document.querySelector("[data-filter='ALL']").classList.add("yt-fc-filter-active");
-
-      allClaims = [];
-      const CHUNK = 4000;
-      const chunks = [];
-      for (let i = 0; i < transcript.length; i += CHUNK) chunks.push(transcript.slice(i, i + CHUNK));
-
-      for (let i = 0; i < chunks.length; i++) {
-        resultsDiv.innerHTML = `
-          <div class="yt-fc-loading">
-            <div class="yt-fc-spinner"></div>
-            <span>Analysing part ${i + 1} of ${chunks.length}...</span>
-          </div>
-          ${allClaims.length ? renderClaimsHTML(allClaims) : ""}`;
-
-        const newClaims = await extractClaims(chunks[i], geminiApiKey);
-        allClaims.push(...newClaims);
-        document.getElementById("yt-fc-count").textContent = `${allClaims.length} claim${allClaims.length !== 1 ? "s" : ""}`;
-        document.getElementById("yt-fc-filters").style.display = allClaims.length ? "flex" : "none";
-      }
-
-      renderClaims();
-    } catch (err) {
-      resultsDiv.innerHTML = `<p class='yt-fc-error'>Error: ${err.message}</p>`;
+      const claims = await extractClaimsWithRetry(chunk, currentApiKey);
+      analyzedUpToMs = toMs;
+      addClaims(claims);
+    } catch (e) {
+      setError(e.message);
     }
   }
 
-  function renderClaimsHTML(claims) {
-    return claims.map(c => `
+  function addClaims(newClaims) {
+    if (!newClaims.length) { renderClaims(); return; }
+    allClaims.push(...newClaims);
+    document.getElementById("yt-fc-count").textContent = `${allClaims.length} claim${allClaims.length !== 1 ? "s" : ""}`;
+    document.getElementById("yt-fc-filters").style.display = "flex";
+    renderClaims();
+  }
+
+  function renderClaims() {
+    const resultsDiv = document.getElementById("yt-factcheck-results");
+    const filtered = activeFilter === "ALL" ? allClaims : allClaims.filter(c => c.verdict === activeFilter);
+    if (!filtered.length) {
+      resultsDiv.innerHTML = allClaims.length
+        ? "<p class='yt-fc-status'>No claims match this filter.</p>"
+        : "<p class='yt-fc-status'>No factual claims detected yet.</p>";
+      return;
+    }
+    resultsDiv.innerHTML = filtered.map(c => `
       <div class="yt-fc-claim yt-fc-${c.verdict.replace(/\s+/g, "-").toLowerCase()}">
         <p class="yt-fc-claim-text">${c.claim}</p>
         <span class="yt-fc-verdict">${c.verdict}</span>
@@ -124,17 +164,19 @@
     `).join("");
   }
 
-  function renderClaims() {
+  function setStatus(msg, keepClaims = false) {
     const resultsDiv = document.getElementById("yt-factcheck-results");
-    const filtered = activeFilter === "ALL" ? allClaims : allClaims.filter(c => c.verdict === activeFilter);
-    if (!filtered.length) {
-      resultsDiv.innerHTML = "<p class='yt-fc-status'>No claims match this filter.</p>";
-      return;
-    }
-    resultsDiv.innerHTML = renderClaimsHTML(filtered);
+    const spinner = `<div class="yt-fc-loading"><div class="yt-fc-spinner"></div><span>${msg}</span></div>`;
+    resultsDiv.innerHTML = keepClaims && allClaims.length
+      ? spinner + resultsDiv.innerHTML
+      : spinner;
   }
 
-  // Auto re-analyze when navigating to a new video (only after first manual trigger)
+  function setError(msg) {
+    document.getElementById("yt-factcheck-results").innerHTML = `<p class='yt-fc-error'>Error: ${msg}</p>`;
+  }
+
+  // Watch for YouTube SPA navigation (only auto re-analyze after first manual trigger)
   let lastUrl = window.location.href;
   new MutationObserver(() => {
     const current = window.location.href;
@@ -143,28 +185,48 @@
     if (!lastAnalyzedVideoId) return;
     const videoId = new URLSearchParams(window.location.search).get("v");
     if (videoId && videoId !== lastAnalyzedVideoId) {
+      clearInterval(analysisInterval);
       sidebar.style.display = "";
-      setTimeout(() => runAnalysis(videoId), 1500);
+      setTimeout(() => startAnalysis(videoId), 1500);
     }
   }).observe(document.body, { childList: true, subtree: true });
 
 })();
 
-// Fetch transcript - tries DOM panel, then YouTube timedtext API
-async function fetchTranscript(videoId) {
-  const domText = readTranscriptPanel();
-  if (domText) return domText;
+// --- Transcript helpers ---
 
-  const opened = await openTranscriptPanel();
-  if (opened) {
-    for (let i = 0; i < 10; i++) {
-      await sleep(500);
-      const text = readTranscriptPanel();
-      if (text) return text;
-    }
+async function fetchTranscriptEvents() {
+  let baseUrl = null;
+  for (const script of document.querySelectorAll("script")) {
+    const t = script.textContent;
+    if (!t.includes("captionTracks")) continue;
+    const m = t.match(/"baseUrl":"(https?:\/\/[^"]+timedtext[^"]+)"/);
+    if (m) { baseUrl = m[1].replace(/\\u0026/g, "&").replace(/\\/g, ""); break; }
   }
+  if (!baseUrl) return null;
 
-  return await fetchTranscriptFromAPI(videoId);
+  try {
+    const resp = await fetch(baseUrl + "&fmt=json3", { credentials: "include" });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const events = (data.events || [])
+      .filter(e => e.segs && e.tStartMs !== undefined)
+      .map(e => ({ tStartMs: e.tStartMs, text: e.segs.map(s => s.utf8 || "").join("").trim() }))
+      .filter(e => e.text);
+    return events.length ? events : null;
+  } catch {
+    return null;
+  }
+}
+
+function getTranscriptChunk(fromMs, toMs) {
+  if (!transcriptEvents) return null;
+  const text = transcriptEvents
+    .filter(e => e.tStartMs >= fromMs && e.tStartMs < toMs)
+    .map(e => e.text)
+    .join(" ")
+    .trim();
+  return text.length > 50 ? text : null;
 }
 
 function readTranscriptPanel() {
@@ -179,7 +241,6 @@ function readTranscriptPanel() {
       if (lines.length > 5) return lines.join(" ");
     }
   }
-
   const selectors = [
     "ytd-transcript-segment-renderer .segment-text",
     "ytd-transcript-segment-renderer yt-formatted-string",
@@ -196,31 +257,15 @@ function readTranscriptPanel() {
   return null;
 }
 
-async function fetchTranscriptFromAPI(_videoId) {
-  try {
-    let baseUrl = null;
-    for (const script of document.querySelectorAll("script")) {
-      const t = script.textContent;
-      if (!t.includes("captionTracks")) continue;
-      const m = t.match(/"baseUrl":"(https?:\/\/[^"]+timedtext[^"]+)"/);
-      if (m) { baseUrl = m[1].replace(/\\u0026/g, "&").replace(/\\/g, ""); break; }
-    }
-    if (!baseUrl) return null;
-
-    const resp = await fetch(baseUrl + "&fmt=json3", { credentials: "include" });
-    if (!resp.ok) return null;
-
-    const data = await resp.json();
-    const text = (data.events || [])
-      .filter(e => e.segs)
-      .map(e => e.segs.map(s => s.utf8 || "").join(""))
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
-    return text.length > 50 ? text : null;
-  } catch {
-    return null;
+async function openAndReadPanel() {
+  const opened = await openTranscriptPanel();
+  if (!opened) return null;
+  for (let i = 0; i < 10; i++) {
+    await sleep(500);
+    const text = readTranscriptPanel();
+    if (text) return text;
   }
+  return null;
 }
 
 async function openTranscriptPanel() {
@@ -229,12 +274,10 @@ async function openTranscriptPanel() {
     const label = (btn.textContent || btn.getAttribute("aria-label") || "").toLowerCase();
     if (label.includes("transcript")) { btn.click(); return true; }
   }
-
   const moreBtn =
     document.querySelector("#above-the-fold #button-shape button") ||
     document.querySelector("ytd-menu-renderer yt-button-shape button") ||
     document.querySelector("#info-contents ytd-menu-renderer button");
-
   if (moreBtn) {
     moreBtn.click();
     await sleep(600);
@@ -244,7 +287,6 @@ async function openTranscriptPanel() {
     }
     document.body.click();
   }
-
   return false;
 }
 
@@ -252,9 +294,23 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function extractClaims(transcript, apiKey) {
-  const trimmed = transcript.slice(0, 8000);
+// --- Gemini ---
 
+async function extractClaimsWithRetry(text, apiKey, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await extractClaims(text, apiKey);
+    } catch (e) {
+      if (i < retries && (e.message.includes("503") || e.message.includes("UNAVAILABLE"))) {
+        await sleep(4000 * (i + 1));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+async function extractClaims(transcript, apiKey) {
   const prompt = `You are a fact-checking assistant. Read the following transcript from a YouTube video.
 
 Your job is to:
@@ -274,7 +330,7 @@ Return your response as a JSON array in this exact format:
 Only return the JSON array, nothing else.
 
 Transcript:
-${trimmed}`;
+${transcript}`;
 
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
@@ -287,7 +343,7 @@ ${trimmed}`;
 
   const data = await response.json();
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error(`Gemini error: ${JSON.stringify(data?.error || data).slice(0, 200)}`);
+  if (!text) throw new Error(JSON.stringify(data?.error || data).slice(0, 200));
 
   const jsonMatch = text.match(/\[[\s\S]*\]/);
   if (!jsonMatch) throw new Error("Could not parse claims from AI response.");
