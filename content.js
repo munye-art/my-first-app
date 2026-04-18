@@ -1,60 +1,135 @@
-// Inject sidebar when on a YouTube video page
 (function () {
   if (document.getElementById("yt-factcheck-sidebar")) return;
 
-  // Create sidebar
+  let lastAnalyzedVideoId = null;
+  let allClaims = [];
+  let activeFilter = "ALL";
+
   const sidebar = document.createElement("div");
   sidebar.id = "yt-factcheck-sidebar";
   sidebar.innerHTML = `
     <div id="yt-factcheck-header">
-      <span>🔍 Fact Checker</span>
-      <button id="yt-factcheck-close">✕</button>
+      <div id="yt-fc-title-area">
+        <span>🔍 Fact Checker</span>
+        <span id="yt-fc-count"></span>
+      </div>
+      <div id="yt-fc-header-btns">
+        <button id="yt-factcheck-minimize" title="Minimize">−</button>
+        <button id="yt-factcheck-close" title="Close">✕</button>
+      </div>
     </div>
     <div id="yt-factcheck-body">
       <button id="yt-factcheck-btn">Check This Video</button>
+      <div id="yt-fc-filters">
+        <button class="yt-fc-filter yt-fc-filter-active" data-filter="ALL">All</button>
+        <button class="yt-fc-filter" data-filter="LIKELY TRUE">✓ True</button>
+        <button class="yt-fc-filter" data-filter="LIKELY FALSE">✗ False</button>
+        <button class="yt-fc-filter" data-filter="UNVERIFIED">? Unverified</button>
+      </div>
       <div id="yt-factcheck-results"></div>
     </div>
   `;
   document.body.appendChild(sidebar);
 
-  // Close sidebar
+  document.getElementById("yt-factcheck-minimize").addEventListener("click", () => {
+    const body = document.getElementById("yt-factcheck-body");
+    const btn = document.getElementById("yt-factcheck-minimize");
+    const isHidden = body.style.display === "none";
+    body.style.display = isHidden ? "" : "none";
+    btn.textContent = isHidden ? "−" : "+";
+  });
+
   document.getElementById("yt-factcheck-close").addEventListener("click", () => {
     sidebar.style.display = "none";
   });
 
-  // Main button click
-  document.getElementById("yt-factcheck-btn").addEventListener("click", async () => {
+  document.getElementById("yt-fc-filters").addEventListener("click", e => {
+    const btn = e.target.closest(".yt-fc-filter");
+    if (!btn) return;
+    activeFilter = btn.dataset.filter;
+    document.querySelectorAll(".yt-fc-filter").forEach(b => b.classList.remove("yt-fc-filter-active"));
+    btn.classList.add("yt-fc-filter-active");
+    renderClaims();
+  });
+
+  document.getElementById("yt-factcheck-btn").addEventListener("click", () => {
+    const videoId = new URLSearchParams(window.location.search).get("v");
+    if (videoId) runAnalysis(videoId);
+  });
+
+  async function runAnalysis(videoId) {
+    lastAnalyzedVideoId = videoId;
     const resultsDiv = document.getElementById("yt-factcheck-results");
-    resultsDiv.innerHTML = "<p class='yt-fc-status'>Fetching transcript...</p>";
+    document.getElementById("yt-fc-filters").style.display = "none";
+    document.getElementById("yt-fc-count").textContent = "";
+
+    resultsDiv.innerHTML = `
+      <div class="yt-fc-loading">
+        <div class="yt-fc-spinner"></div>
+        <span>Fetching transcript...</span>
+      </div>`;
 
     try {
-      const videoId = new URLSearchParams(window.location.search).get("v");
-      if (!videoId) throw new Error("Could not find video ID.");
-
-      // Fetch transcript
       const transcript = await fetchTranscript(videoId);
       if (!transcript) throw new Error("No transcript available for this video.");
 
-      resultsDiv.innerHTML = "<p class='yt-fc-status'>Analysing claims with AI...</p>";
+      resultsDiv.innerHTML = `
+        <div class="yt-fc-loading">
+          <div class="yt-fc-spinner"></div>
+          <span>Analysing claims...</span>
+        </div>`;
 
-      // Get API key from storage
       const { geminiApiKey } = await chrome.storage.sync.get("geminiApiKey");
       if (!geminiApiKey) {
-        resultsDiv.innerHTML = "<p class='yt-fc-error'>No API key found. Please set your Gemini API key in the extension popup.</p>";
+        resultsDiv.innerHTML = "<p class='yt-fc-error'>No API key found. Set your Gemini API key in the extension popup.</p>";
         return;
       }
 
-      // Send to Gemini
-      const claims = await extractClaims(transcript, geminiApiKey);
-      displayResults(claims, resultsDiv);
-
+      allClaims = await extractClaims(transcript, geminiApiKey);
+      activeFilter = "ALL";
+      document.querySelectorAll(".yt-fc-filter").forEach(b => b.classList.remove("yt-fc-filter-active"));
+      document.querySelector("[data-filter='ALL']").classList.add("yt-fc-filter-active");
+      document.getElementById("yt-fc-count").textContent = `${allClaims.length} claim${allClaims.length !== 1 ? "s" : ""}`;
+      document.getElementById("yt-fc-filters").style.display = allClaims.length ? "flex" : "none";
+      renderClaims();
     } catch (err) {
       resultsDiv.innerHTML = `<p class='yt-fc-error'>Error: ${err.message}</p>`;
     }
-  });
+  }
+
+  function renderClaims() {
+    const resultsDiv = document.getElementById("yt-factcheck-results");
+    const filtered = activeFilter === "ALL" ? allClaims : allClaims.filter(c => c.verdict === activeFilter);
+    if (!filtered.length) {
+      resultsDiv.innerHTML = "<p class='yt-fc-status'>No claims match this filter.</p>";
+      return;
+    }
+    resultsDiv.innerHTML = filtered.map(c => `
+      <div class="yt-fc-claim yt-fc-${c.verdict.replace(/\s+/g, "-").toLowerCase()}">
+        <p class="yt-fc-claim-text">${c.claim}</p>
+        <span class="yt-fc-verdict">${c.verdict}</span>
+        <p class="yt-fc-reason">${c.reason}</p>
+      </div>
+    `).join("");
+  }
+
+  // Auto re-analyze when navigating to a new video (only after first manual trigger)
+  let lastUrl = window.location.href;
+  new MutationObserver(() => {
+    const current = window.location.href;
+    if (current === lastUrl) return;
+    lastUrl = current;
+    if (!lastAnalyzedVideoId) return;
+    const videoId = new URLSearchParams(window.location.search).get("v");
+    if (videoId && videoId !== lastAnalyzedVideoId) {
+      sidebar.style.display = "";
+      setTimeout(() => runAnalysis(videoId), 1500);
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+
 })();
 
-// Fetch transcript - tries DOM, then YouTube timedtext API
+// Fetch transcript - tries DOM panel, then YouTube timedtext API
 async function fetchTranscript(videoId) {
   const domText = readTranscriptPanel();
   if (domText) return domText;
@@ -68,25 +143,22 @@ async function fetchTranscript(videoId) {
     }
   }
 
-  // Fall back to YouTube timedtext API
   return await fetchTranscriptFromAPI(videoId);
 }
 
 function readTranscriptPanel() {
-  // Try engagement panel innerText (works even if children are in shadow DOM)
-  const panels = document.querySelectorAll('ytd-engagement-panel-section-list-renderer');
+  const panels = document.querySelectorAll("ytd-engagement-panel-section-list-renderer");
   for (const panel of panels) {
-    const visibility = panel.getAttribute('visibility') || '';
-    if (visibility.includes('EXPANDED')) {
-      const raw = panel.innerText || panel.textContent || '';
-      const lines = raw.split('\n')
+    const visibility = panel.getAttribute("visibility") || "";
+    if (visibility.includes("EXPANDED")) {
+      const raw = panel.innerText || panel.textContent || "";
+      const lines = raw.split("\n")
         .map(l => l.trim())
         .filter(l => l && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(l) && l.length > 2);
-      if (lines.length > 5) return lines.join(' ');
+      if (lines.length > 5) return lines.join(" ");
     }
   }
 
-  // Try direct selectors as fallback
   const selectors = [
     "ytd-transcript-segment-renderer .segment-text",
     "ytd-transcript-segment-renderer yt-formatted-string",
@@ -106,42 +178,37 @@ function readTranscriptPanel() {
 async function fetchTranscriptFromAPI(_videoId) {
   try {
     let baseUrl = null;
-    for (const script of document.querySelectorAll('script')) {
+    for (const script of document.querySelectorAll("script")) {
       const t = script.textContent;
-      if (!t.includes('captionTracks')) continue;
+      if (!t.includes("captionTracks")) continue;
       const m = t.match(/"baseUrl":"(https?:\/\/[^"]+timedtext[^"]+)"/);
-      if (m) { baseUrl = m[1].replace(/\\u0026/g, '&').replace(/\\/g, ''); break; }
+      if (m) { baseUrl = m[1].replace(/\\u0026/g, "&").replace(/\\/g, ""); break; }
     }
     if (!baseUrl) return null;
 
-    const resp = await fetch(baseUrl + '&fmt=json3', { credentials: 'include' });
+    const resp = await fetch(baseUrl + "&fmt=json3", { credentials: "include" });
     if (!resp.ok) return null;
 
     const data = await resp.json();
     const text = (data.events || [])
       .filter(e => e.segs)
-      .map(e => e.segs.map(s => s.utf8 || '').join(''))
-      .join(' ')
-      .replace(/\s+/g, ' ')
+      .map(e => e.segs.map(s => s.utf8 || "").join(""))
+      .join(" ")
+      .replace(/\s+/g, " ")
       .trim();
     return text.length > 50 ? text : null;
-  } catch (e) {
+  } catch {
     return null;
   }
 }
 
 async function openTranscriptPanel() {
-  // Method 1: look for a visible "Show transcript" button anywhere
   const allButtons = document.querySelectorAll("button, [role='button'], tp-yt-paper-button");
   for (const btn of allButtons) {
     const label = (btn.textContent || btn.getAttribute("aria-label") || "").toLowerCase();
-    if (label.includes("transcript")) {
-      btn.click();
-      return true;
-    }
+    if (label.includes("transcript")) { btn.click(); return true; }
   }
 
-  // Method 2: open the "..." more actions menu and find transcript option
   const moreBtn =
     document.querySelector("#above-the-fold #button-shape button") ||
     document.querySelector("ytd-menu-renderer yt-button-shape button") ||
@@ -150,16 +217,10 @@ async function openTranscriptPanel() {
   if (moreBtn) {
     moreBtn.click();
     await sleep(600);
-
     const items = document.querySelectorAll("tp-yt-paper-item, ytd-menu-service-item-renderer");
     for (const item of items) {
-      if (item.textContent?.toLowerCase().includes("transcript")) {
-        item.click();
-        return true;
-      }
+      if (item.textContent?.toLowerCase().includes("transcript")) { item.click(); return true; }
     }
-
-    // Close menu if transcript not found
     document.body.click();
   }
 
@@ -170,9 +231,8 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// Send transcript to Gemini and extract factual claims
 async function extractClaims(transcript, apiKey) {
-  const trimmed = transcript.slice(0, 8000); // limit to avoid token overload
+  const trimmed = transcript.slice(0, 8000);
 
   const prompt = `You are a fact-checking assistant. Read the following transcript from a YouTube video.
 
@@ -200,9 +260,7 @@ ${trimmed}`;
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }]
-      })
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
     }
   );
 
@@ -214,20 +272,4 @@ ${trimmed}`;
   if (!jsonMatch) throw new Error("Could not parse claims from AI response.");
 
   return JSON.parse(jsonMatch[0]);
-}
-
-// Display results in the sidebar
-function displayResults(claims, container) {
-  if (!claims.length) {
-    container.innerHTML = "<p class='yt-fc-status'>No clear factual claims detected.</p>";
-    return;
-  }
-
-  container.innerHTML = claims.map(c => `
-    <div class="yt-fc-claim yt-fc-${c.verdict.replace(/\s+/g, "-").toLowerCase()}">
-      <p class="yt-fc-claim-text">${c.claim}</p>
-      <span class="yt-fc-verdict">${c.verdict}</span>
-      <p class="yt-fc-reason">${c.reason}</p>
-    </div>
-  `).join("");
 }
