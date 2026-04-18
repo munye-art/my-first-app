@@ -112,11 +112,10 @@ async function fetchTranscriptFromAPI(_videoId) {
       const m = t.match(/"baseUrl":"(https?:\/\/[^"]+timedtext[^"]+)"/);
       if (m) { baseUrl = m[1].replace(/\\u0026/g, '&').replace(/\\/g, ''); break; }
     }
-    console.log('yt-factcheck: timedtext baseUrl:', baseUrl ? baseUrl.slice(0, 80) : 'not found');
     if (!baseUrl) return null;
 
     const resp = await fetch(baseUrl + '&fmt=json3', { credentials: 'include' });
-    if (!resp.ok) { console.log('yt-factcheck: timedtext status:', resp.status); return null; }
+    if (!resp.ok) return null;
 
     const data = await resp.json();
     const text = (data.events || [])
@@ -127,7 +126,6 @@ async function fetchTranscriptFromAPI(_videoId) {
       .trim();
     return text.length > 50 ? text : null;
   } catch (e) {
-    console.log('yt-factcheck: API fetch error:', e.message);
     return null;
   }
 }
@@ -209,8 +207,6 @@ ${trimmed}`;
   );
 
   const data = await response.json();
-  console.log("yt-factcheck: Gemini status:", response.status);
-  console.log("yt-factcheck: Gemini response:", JSON.stringify(data).slice(0, 400));
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) throw new Error(`Gemini error: ${JSON.stringify(data?.error || data).slice(0, 200)}`);
 
