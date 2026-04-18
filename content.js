@@ -85,16 +85,43 @@
         return;
       }
 
-      allClaims = await extractClaims(transcript, geminiApiKey);
       activeFilter = "ALL";
       document.querySelectorAll(".yt-fc-filter").forEach(b => b.classList.remove("yt-fc-filter-active"));
       document.querySelector("[data-filter='ALL']").classList.add("yt-fc-filter-active");
-      document.getElementById("yt-fc-count").textContent = `${allClaims.length} claim${allClaims.length !== 1 ? "s" : ""}`;
-      document.getElementById("yt-fc-filters").style.display = allClaims.length ? "flex" : "none";
+
+      allClaims = [];
+      const CHUNK = 4000;
+      const chunks = [];
+      for (let i = 0; i < transcript.length; i += CHUNK) chunks.push(transcript.slice(i, i + CHUNK));
+
+      for (let i = 0; i < chunks.length; i++) {
+        resultsDiv.innerHTML = `
+          <div class="yt-fc-loading">
+            <div class="yt-fc-spinner"></div>
+            <span>Analysing part ${i + 1} of ${chunks.length}...</span>
+          </div>
+          ${allClaims.length ? renderClaimsHTML(allClaims) : ""}`;
+
+        const newClaims = await extractClaims(chunks[i], geminiApiKey);
+        allClaims.push(...newClaims);
+        document.getElementById("yt-fc-count").textContent = `${allClaims.length} claim${allClaims.length !== 1 ? "s" : ""}`;
+        document.getElementById("yt-fc-filters").style.display = allClaims.length ? "flex" : "none";
+      }
+
       renderClaims();
     } catch (err) {
       resultsDiv.innerHTML = `<p class='yt-fc-error'>Error: ${err.message}</p>`;
     }
+  }
+
+  function renderClaimsHTML(claims) {
+    return claims.map(c => `
+      <div class="yt-fc-claim yt-fc-${c.verdict.replace(/\s+/g, "-").toLowerCase()}">
+        <p class="yt-fc-claim-text">${c.claim}</p>
+        <span class="yt-fc-verdict">${c.verdict}</span>
+        <p class="yt-fc-reason">${c.reason}</p>
+      </div>
+    `).join("");
   }
 
   function renderClaims() {
@@ -104,13 +131,7 @@
       resultsDiv.innerHTML = "<p class='yt-fc-status'>No claims match this filter.</p>";
       return;
     }
-    resultsDiv.innerHTML = filtered.map(c => `
-      <div class="yt-fc-claim yt-fc-${c.verdict.replace(/\s+/g, "-").toLowerCase()}">
-        <p class="yt-fc-claim-text">${c.claim}</p>
-        <span class="yt-fc-verdict">${c.verdict}</span>
-        <p class="yt-fc-reason">${c.reason}</p>
-      </div>
-    `).join("");
+    resultsDiv.innerHTML = renderClaimsHTML(filtered);
   }
 
   // Auto re-analyze when navigating to a new video (only after first manual trigger)
