@@ -102,11 +102,11 @@ let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscript
       return;
     }
 
-    // Analyze what's been watched so far (at least first chunk)
+    // Start from current playback position (so jumping to 40min starts there)
     const video = document.querySelector("video");
     const currentMs = (video?.currentTime || 0) * 1000;
-    const toMs = Math.max(currentMs, CHUNK_MS);
-    await analyzeChunk(toMs);
+    analyzedUpToMs = Math.max(0, currentMs - 5000);
+    await analyzeChunk(analyzedUpToMs + CHUNK_MS);
 
     // Keep checking as video plays
     analysisInterval = setInterval(checkProgress, CHECK_INTERVAL_MS);
@@ -122,25 +122,26 @@ let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscript
   }
 
   async function analyzeChunk(toMs) {
-    const chunk = getTranscriptChunk(analyzedUpToMs, toMs);
+    const fromMs = analyzedUpToMs;
+    const chunk = getTranscriptChunk(fromMs, toMs);
     if (!chunk) { analyzedUpToMs = toMs; return; }
 
-    const fromMin = Math.round(analyzedUpToMs / 60000);
+    const fromMin = Math.round(fromMs / 60000);
     const toMin = Math.round(toMs / 60000);
     setStatus(`Analysing ${fromMin}–${toMin} min...`, true);
 
     try {
       const claims = await extractClaimsWithRetry(chunk, currentApiKey);
       analyzedUpToMs = toMs;
-      addClaims(claims);
+      addClaims(claims, fromMs);
     } catch (e) {
       setError(e.message);
     }
   }
 
-  function addClaims(newClaims) {
+  function addClaims(newClaims, fromMs = 0) {
     if (!newClaims.length) { renderClaims(); return; }
-    allClaims.push(...newClaims);
+    allClaims.push(...newClaims.map(c => ({ ...c, timestampMs: fromMs })));
     document.getElementById("yt-fc-count").textContent = `${allClaims.length} claim${allClaims.length !== 1 ? "s" : ""}`;
     document.getElementById("yt-fc-filters").style.display = "flex";
     renderClaims();
@@ -157,8 +158,11 @@ let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscript
     }
     resultsDiv.innerHTML = filtered.map(c => `
       <div class="yt-fc-claim yt-fc-${c.verdict.replace(/\s+/g, "-").toLowerCase()}">
+        <div class="yt-fc-claim-header">
+          <span class="yt-fc-verdict">${c.verdict}</span>
+          <button class="yt-fc-timestamp" data-ms="${c.timestampMs || 0}">▶ ${formatTime(c.timestampMs || 0)}</button>
+        </div>
         <p class="yt-fc-claim-text">${c.claim}</p>
-        <span class="yt-fc-verdict">${c.verdict}</span>
         <p class="yt-fc-reason">${c.reason}</p>
       </div>
     `).join("");
@@ -175,6 +179,13 @@ let transcriptEvents = null; // [{tStartMs, text}] — shared with getTranscript
   function setError(msg) {
     document.getElementById("yt-factcheck-results").innerHTML = `<p class='yt-fc-error'>Error: ${msg}</p>`;
   }
+
+  document.getElementById("yt-factcheck-results").addEventListener("click", e => {
+    const btn = e.target.closest(".yt-fc-timestamp");
+    if (!btn) return;
+    const video = document.querySelector("video");
+    if (video) video.currentTime = parseInt(btn.dataset.ms) / 1000;
+  });
 
   // Watch for YouTube SPA navigation (only auto re-analyze after first manual trigger)
   let lastUrl = window.location.href;
@@ -292,6 +303,15 @@ async function openTranscriptPanel() {
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
+}
+
+function formatTime(ms) {
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 // --- Gemini ---
