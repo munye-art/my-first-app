@@ -54,30 +54,82 @@
   });
 })();
 
-// Fetch transcript by opening YouTube's transcript panel and reading the DOM
-async function fetchTranscript(_videoId) {
-  // If transcript panel is already open, read it directly
-  const existing = readTranscriptPanel();
-  if (existing) return existing;
+// Fetch transcript - tries DOM, then YouTube timedtext API
+async function fetchTranscript(videoId) {
+  const domText = readTranscriptPanel();
+  if (domText) return domText;
 
-  // Try to open the transcript panel via YouTube's UI
   const opened = await openTranscriptPanel();
-  if (!opened) return null;
-
-  // Wait up to 5 seconds for segments to appear
-  for (let i = 0; i < 10; i++) {
-    await sleep(500);
-    const text = readTranscriptPanel();
-    if (text) return text;
+  if (opened) {
+    for (let i = 0; i < 10; i++) {
+      await sleep(500);
+      const text = readTranscriptPanel();
+      if (text) return text;
+    }
   }
 
-  return null;
+  // Fall back to YouTube timedtext API
+  return await fetchTranscriptFromAPI(videoId);
 }
 
 function readTranscriptPanel() {
-  const segs = document.querySelectorAll("ytd-transcript-segment-renderer .segment-text");
-  if (!segs.length) return null;
-  return Array.from(segs).map(s => s.textContent.trim()).filter(Boolean).join(" ");
+  // Try engagement panel innerText (works even if children are in shadow DOM)
+  const panels = document.querySelectorAll('ytd-engagement-panel-section-list-renderer');
+  for (const panel of panels) {
+    const visibility = panel.getAttribute('visibility') || '';
+    if (visibility.includes('EXPANDED')) {
+      const raw = panel.innerText || panel.textContent || '';
+      const lines = raw.split('\n')
+        .map(l => l.trim())
+        .filter(l => l && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(l) && l.length > 2);
+      if (lines.length > 5) return lines.join(' ');
+    }
+  }
+
+  // Try direct selectors as fallback
+  const selectors = [
+    "ytd-transcript-segment-renderer .segment-text",
+    "ytd-transcript-segment-renderer yt-formatted-string",
+    "ytd-transcript-segment-renderer",
+    ".segment-text",
+  ];
+  for (const sel of selectors) {
+    const segs = document.querySelectorAll(sel);
+    if (segs.length > 3) {
+      const text = Array.from(segs).map(s => s.textContent.trim()).filter(Boolean).join(" ");
+      if (text.length > 50) return text;
+    }
+  }
+  return null;
+}
+
+async function fetchTranscriptFromAPI(_videoId) {
+  try {
+    let baseUrl = null;
+    for (const script of document.querySelectorAll('script')) {
+      const t = script.textContent;
+      if (!t.includes('captionTracks')) continue;
+      const m = t.match(/"baseUrl":"(https?:\/\/[^"]+timedtext[^"]+)"/);
+      if (m) { baseUrl = m[1].replace(/\\u0026/g, '&').replace(/\\/g, ''); break; }
+    }
+    console.log('yt-factcheck: timedtext baseUrl:', baseUrl ? baseUrl.slice(0, 80) : 'not found');
+    if (!baseUrl) return null;
+
+    const resp = await fetch(baseUrl + '&fmt=json3', { credentials: 'include' });
+    if (!resp.ok) { console.log('yt-factcheck: timedtext status:', resp.status); return null; }
+
+    const data = await resp.json();
+    const text = (data.events || [])
+      .filter(e => e.segs)
+      .map(e => e.segs.map(s => s.utf8 || '').join(''))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return text.length > 50 ? text : null;
+  } catch (e) {
+    console.log('yt-factcheck: API fetch error:', e.message);
+    return null;
+  }
 }
 
 async function openTranscriptPanel() {
